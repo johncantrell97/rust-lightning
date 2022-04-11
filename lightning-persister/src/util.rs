@@ -7,20 +7,13 @@ use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::io::AsRawFd;
 
+use lightning::util::ser::Writeable;
+
 #[cfg(target_os = "windows")]
 use {
 	std::ffi::OsStr,
 	std::os::windows::ffi::OsStrExt
 };
-
-pub(crate) trait DiskWriteable {
-	fn write_to_file(&self, writer: &mut fs::File) -> Result<(), std::io::Error>;
-}
-
-pub(crate) fn get_full_filepath(mut filepath: PathBuf, filename: String) -> String {
-	filepath.push(filename);
-	filepath.to_str().unwrap().to_string()
-}
 
 #[cfg(target_os = "windows")]
 macro_rules! call {
@@ -39,21 +32,22 @@ fn path_to_windows_str<T: AsRef<OsStr>>(path: T) -> Vec<winapi::shared::ntdef::W
 }
 
 #[allow(bare_trait_objects)]
-pub(crate) fn write_to_file<D: DiskWriteable>(path: PathBuf, filename: String, data: &D) -> std::io::Result<()> {
+pub(crate) fn write_to_file<W: Writeable>(filename_with_path: String, data: &W) -> std::io::Result<()> {
+	let full_path = PathBuf::from(&filename_with_path);
+	let path = full_path.parent().unwrap();
 	fs::create_dir_all(path.clone())?;
 	// Do a crazy dance with lots of fsync()s to be overly cautious here...
 	// We never want to end up in a state where we've lost the old data, or end up using the
 	// old data on power loss after we've returned.
 	// The way to atomically write a file on Unix platforms is:
 	// open(tmpname), write(tmpfile), fsync(tmpfile), close(tmpfile), rename(), fsync(dir)
-	let filename_with_path = get_full_filepath(path, filename);
 	let tmp_filename = format!("{}.tmp", filename_with_path.clone());
 
 	{
 		// Note that going by rust-lang/rust@d602a6b, on MacOS it is only safe to use
 		// rust stdlib 1.36 or higher.
 		let mut f = fs::File::create(&tmp_filename)?;
-		data.write_to_file(&mut f)?;
+		data.write(&mut f)?;
 		f.sync_all()?;
 	}
 	// Fsync the parent directory on Unix.
@@ -87,15 +81,17 @@ pub(crate) fn write_to_file<D: DiskWriteable>(path: PathBuf, filename: String, d
 
 #[cfg(test)]
 mod tests {
-	use super::{DiskWriteable, get_full_filepath, write_to_file};
+	use lightning::util::ser::{Writer, Writeable};
+
+use super::{write_to_file};
 	use std::fs;
 	use std::io;
 	use std::io::Write;
-	use std::path::PathBuf;
+	use std::path::{PathBuf, MAIN_SEPARATOR};
 
 	struct TestWriteable{}
-	impl DiskWriteable for TestWriteable {
-		fn write_to_file(&self, writer: &mut fs::File) -> Result<(), io::Error> {
+	impl Writeable for TestWriteable {
+		fn write<W: Writer>(&self, writer: &mut W) -> Result<(), std::io::Error> {
 			writer.write_all(&[42; 1])
 		}
 	}
@@ -113,7 +109,8 @@ mod tests {
 		let mut perms = fs::metadata(path.to_string()).unwrap().permissions();
 		perms.set_readonly(true);
 		fs::set_permissions(path.to_string(), perms).unwrap();
-		match write_to_file(PathBuf::from(path.to_string()), filename, &test_writeable) {
+
+		match write_to_file(format!("{}{}{}", path, MAIN_SEPARATOR, filename), &test_writeable) {
 			Err(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
 			_ => panic!("Unexpected error message")
 		}
@@ -131,10 +128,11 @@ mod tests {
 	fn test_rename_failure() {
 		let test_writeable = TestWriteable{};
 		let filename = "test_rename_failure_filename";
-		let path = PathBuf::from("test_rename_failure_dir");
+		let path = "test_rename_failure_dir";
+		let full_file_path = format!("{}{}{}", path, MAIN_SEPARATOR, filename);
 		// Create the channel data file and make it a directory.
-		fs::create_dir_all(get_full_filepath(path.clone(), filename.to_string())).unwrap();
-		match write_to_file(path.clone(), filename.to_string(), &test_writeable) {
+		fs::create_dir_all(full_file_path.clone()).unwrap();
+		match write_to_file(full_file_path, &test_writeable) {
 			Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EISDIR)),
 			_ => panic!("Unexpected Ok(())")
 		}
@@ -144,16 +142,17 @@ mod tests {
 	#[test]
 	fn test_diskwriteable_failure() {
 		struct FailingWriteable {}
-		impl DiskWriteable for FailingWriteable {
-			fn write_to_file(&self, _writer: &mut fs::File) -> Result<(), std::io::Error> {
+		impl Writeable for FailingWriteable {
+			fn write<W: Writer>(&self, _writer: &mut W) -> Result<(), std::io::Error> {
 				Err(std::io::Error::new(std::io::ErrorKind::Other, "expected failure"))
 			}
 		}
 
 		let filename = "test_diskwriteable_failure";
-		let path = PathBuf::from("test_diskwriteable_failure_dir");
+		let path = "test_diskwriteable_failure_dir";
 		let test_writeable = FailingWriteable{};
-		match write_to_file(path.clone(), filename.to_string(), &test_writeable) {
+		let full_path = format!("{}{}{}", path, MAIN_SEPARATOR, filename);
+		match write_to_file(full_path.clone(), &test_writeable) {
 			Err(e) => {
 				assert_eq!(e.kind(), std::io::ErrorKind::Other);
 				assert_eq!(e.get_ref().unwrap().to_string(), "expected failure");
@@ -170,12 +169,11 @@ mod tests {
 	fn test_tmp_file_creation_failure() {
 		let test_writeable = TestWriteable{};
 		let filename = "test_tmp_file_creation_failure_filename".to_string();
-		let path = PathBuf::from("test_tmp_file_creation_failure_dir");
-
-		// Create the tmp file and make it a directory.
-		let tmp_path = get_full_filepath(path.clone(), format!("{}.tmp", filename.clone()));
+		let path = "test_tmp_file_creation_failure_dir";
+		let tmp_path = format!("{}{}{}.tmp", path, MAIN_SEPARATOR, filename.clone());
+		let full_filepath = format!("{}{}{}", path, MAIN_SEPARATOR, filename);
 		fs::create_dir_all(tmp_path).unwrap();
-		match write_to_file(path, filename, &test_writeable) {
+		match write_to_file(full_filepath, &test_writeable) {
 			Err(e) => {
 				#[cfg(not(target_os = "windows"))]
 				assert_eq!(e.raw_os_error(), Some(libc::EISDIR));

@@ -20,6 +20,7 @@ use lightning::ln::peer_handler::{CustomMessageHandler, PeerManager, SocketDescr
 use lightning::routing::network_graph::{NetworkGraph, NetGraphMsgHandler};
 use lightning::util::events::{Event, EventHandler, EventsProvider};
 use lightning::util::logger::Logger;
+use lightning_persister::Persister;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -80,22 +81,7 @@ const FIRST_NETWORK_PRUNE_TIMER: u64 = 60;
 #[cfg(test)]
 const FIRST_NETWORK_PRUNE_TIMER: u64 = 1;
 
-/// Trait that handles persisting a [`ChannelManager`] and [`NetworkGraph`] to disk.
-pub trait Persister<Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>
-where
-	M::Target: 'static + chain::Watch<Signer>,
-	T::Target: 'static + BroadcasterInterface,
-	K::Target: 'static + KeysInterface<Signer = Signer>,
-	F::Target: 'static + FeeEstimator,
-	L::Target: 'static + Logger,
-{
-	/// Persist the given [`ChannelManager`] to disk, returning an error if persistence failed
-	/// (which will cause the [`BackgroundProcessor`] which called this method to exit).
-	fn persist_manager(&self, channel_manager: &ChannelManager<Signer, M, T, K, F, L>) -> Result<(), std::io::Error>;
 
-	/// Persist the given [`NetworkGraph`] to disk, returning an error if persistence failed.
-	fn persist_graph(&self, network_graph: &NetworkGraph) -> Result<(), std::io::Error>;
-}
 
 /// Decorates an [`EventHandler`] with common functionality provided by standard [`EventHandler`]s.
 struct DecoratingEventHandler<
@@ -142,7 +128,7 @@ impl BackgroundProcessor {
 	/// provided implementation.
 	///
 	/// [`Persister::persist_graph`] is responsible for writing out the [`NetworkGraph`] to disk. See
-	/// [`NetworkGraph::write`] for writing out a [`NetworkGraph`]. See [`FilesystemPersister::persist_network_graph`]
+	/// [`NetworkGraph::write`] for writing out a [`NetworkGraph`]. See [`FilesystemPersister::persist_graph`]
 	/// for Rust-Lightning's provided implementation.
 	///
 	/// Typically, users should either implement [`Persister::persist_manager`] to never return an
@@ -161,8 +147,8 @@ impl BackgroundProcessor {
 	/// [`stop`]: Self::stop
 	/// [`ChannelManager`]: lightning::ln::channelmanager::ChannelManager
 	/// [`ChannelManager::write`]: lightning::ln::channelmanager::ChannelManager#impl-Writeable
-	/// [`FilesystemPersister::persist_manager`]: lightning_persister::FilesystemPersister::persist_manager
-	/// [`FilesystemPersister::persist_network_graph`]: lightning_persister::FilesystemPersister::persist_network_graph
+	/// [`FilesystemPersister::persist_manager`]: lightning_persister::FilesystemPersister#impl-Persister
+	/// [`FilesystemPersister::persist_graph`]: lightning_persister::FilesystemPersister#impl-Persister
 	/// [`NetworkGraph`]: lightning::routing::network_graph::NetworkGraph
 	/// [`NetworkGraph::write`]: lightning::routing::network_graph::NetworkGraph#impl-Writeable
 	pub fn start<
@@ -180,7 +166,7 @@ impl BackgroundProcessor {
 		CMH: 'static + Deref + Send + Sync,
 		RMH: 'static + Deref + Send + Sync,
 		EH: 'static + EventHandler + Send,
-		PS: 'static + Send + Persister<Signer, CW, T, K, F, L>,
+		PS: 'static + Send + Persister,
 		M: 'static + Deref<Target = ChainMonitor<Signer, CF, T, F, L, P>> + Send + Sync,
 		CM: 'static + Deref<Target = ChannelManager<Signer, CW, T, K, F, L>> + Send + Sync,
 		NG: 'static + Deref<Target = NetGraphMsgHandler<G, CA, L>> + Send + Sync,
@@ -367,8 +353,8 @@ mod tests {
 	use lightning::util::test_utils;
 	use lightning_invoice::payment::{InvoicePayer, RetryAttempts};
 	use lightning_invoice::utils::DefaultRouter;
-	use lightning_persister::FilesystemPersister;
-	use std::fs;
+	use lightning_persister::{FilesystemPersister, Persister as LPPersister};
+	use std::fs::{self, File};
 	use std::ops::Deref;
 	use std::path::PathBuf;
 	use std::sync::{Arc, Mutex};
@@ -414,12 +400,14 @@ mod tests {
 	struct Persister {
 		data_dir: String,
 		graph_error: Option<(std::io::ErrorKind, &'static str)>,
-		manager_error: Option<(std::io::ErrorKind, &'static str)>
+		manager_error: Option<(std::io::ErrorKind, &'static str)>,
+		filesystem_persister: FilesystemPersister
 	}
 
 	impl Persister {
 		fn new(data_dir: String) -> Self {
-			Self { data_dir, graph_error: None, manager_error: None }
+			let filesystem_persister = FilesystemPersister::new(data_dir.clone());
+			Self { data_dir, graph_error: None, manager_error: None, filesystem_persister }
 		}
 
 		fn with_graph_error(self, error: std::io::ErrorKind, message: &'static str) -> Self {
@@ -431,23 +419,24 @@ mod tests {
 		}
 	}
 
-	impl<Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L:Deref> super::Persister<Signer, M, T, K, F, L> for Persister where
+	impl LPPersister for Persister 
+	{
+		fn persist_manager<Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref>(&self, channel_manager: &ChannelManager<Signer, M, T, K, F, L>) -> Result<(), std::io::Error> where
 		M::Target: 'static + chain::Watch<Signer>,
 		T::Target: 'static + BroadcasterInterface,
 		K::Target: 'static + KeysInterface<Signer = Signer>,
 		F::Target: 'static + FeeEstimator,
 		L::Target: 'static + Logger,
-	{
-		fn persist_manager(&self, channel_manager: &ChannelManager<Signer, M, T, K, F, L>) -> Result<(), std::io::Error> {
+		{
 			match self.manager_error {
-				None => FilesystemPersister::persist_manager(self.data_dir.clone(), channel_manager),
+				None => self.filesystem_persister.persist_manager(channel_manager),
 				Some((error, message)) => Err(std::io::Error::new(error, message)),
 			}
 		}
 
 		fn persist_graph(&self, network_graph: &NetworkGraph) -> Result<(), std::io::Error> {
 			match self.graph_error {
-				None => FilesystemPersister::persist_network_graph(self.data_dir.clone(), network_graph),
+				None => self.filesystem_persister.persist_graph(network_graph),
 				Some((error, message)) => Err(std::io::Error::new(error, message)),
 			}
 		}
